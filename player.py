@@ -7,13 +7,14 @@ import soundfile as sf
 class AudioPlayer:
     VIRTUAL_MIC_NAME = "CABLE Input"
 
+    # Larger buffer = smoother at cost of minor latency (~93ms @ 44100)
+    BLOCKSIZE = 4096
+
     def __init__(self):
         self._data: np.ndarray | None = None
         self._sr: int | None = None
         self._pos: int = 0
         self._lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
         self.volume: float = 0.8
         self.is_playing: bool = False
 
@@ -21,6 +22,7 @@ class AudioPlayer:
         self._playback_ended_flag: bool = False
         self._error_msg: str | None = None
 
+        self._stream: sd.OutputStream | None = None
         self._output_device = self._find_virtual_mic()
 
     # ── Device ───────────────────────────────────────────────
@@ -79,77 +81,130 @@ class AudioPlayer:
             self._pos = 0
         return len(data) / sr
 
+    # ── Callback ─────────────────────────────────────────────
+
+    def _make_callback(self):
+        """Returns a PortAudio callback. Called by audio driver on a real-time thread — no allocations, no GIL issues."""
+        def callback(outdata: np.ndarray, frames: int, time_info, status):
+            with self._lock:
+                if self._data is None or self._pos >= len(self._data):
+                    outdata[:] = 0
+                    self._playback_ended_flag = True
+                    raise sd.CallbackStop()
+
+                end = min(self._pos + frames, len(self._data))
+                n = end - self._pos
+                outdata[:n] = self._data[self._pos:end] * self.volume
+                if n < frames:
+                    # Pad remaining frames with silence then stop
+                    outdata[n:] = 0
+                    self._pos = len(self._data)
+                    self._playback_ended_flag = True
+                    raise sd.CallbackStop()
+                self._pos = end
+        return callback
+
+    def _on_stream_finished(self):
+        self.is_playing = False
+
     # ── Playback ─────────────────────────────────────────────
 
     def play(self):
         if self._data is None:
             return
-        self.stop()
-        self._stop_event.clear()
+        
+        # Stop existing stream without resetting _pos
+        self.is_playing = False
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+            
         self._playback_ended_flag = False
-        self.is_playing = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
 
-    def _loop(self):
-        CHUNK = 2048
         try:
-            with sd.OutputStream(device=self._output_device, samplerate=self._sr,
-                                  channels=2, dtype="float32", blocksize=CHUNK) as stream:
-                while not self._stop_event.is_set():
-                    with self._lock:
-                        if self._pos >= len(self._data):
-                            break
-                        end = min(self._pos + CHUNK, len(self._data))
-                        chunk = self._data[self._pos:end] * self.volume
-                        self._pos = end
-                    if len(chunk) < CHUNK:
-                        chunk = np.vstack([chunk, np.zeros((CHUNK - len(chunk), 2), dtype=np.float32)])
-                    stream.write(chunk)
+            self._stream = sd.OutputStream(
+                device=self._output_device,
+                samplerate=self._sr,
+                channels=2,
+                dtype="float32",
+                blocksize=self.BLOCKSIZE,
+                callback=self._make_callback(),
+                finished_callback=self._on_stream_finished,
+                latency="low",
+            )
+            self.is_playing = True
+            self._stream.start()
         except Exception as e:
             self._error_msg = str(e)
-        finally:
-            reached_end = self._data is not None and self._pos >= len(self._data)
             self.is_playing = False
-            if reached_end:
-                self._playback_ended_flag = True
 
     def stop(self):
-        self._stop_event.set()
         self.is_playing = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
         with self._lock:
             self._pos = 0
 
     def pause(self):
-        self._stop_event.set()
         self.is_playing = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
 
     def resume(self):
         if self._data is not None and not self.is_playing:
-            self._stop_event.clear()
-            self.is_playing = True
-            self._thread = threading.Thread(target=self._loop, daemon=True)
-            self._thread.start()
+            if self._stream is not None:
+                try:
+                    self._stream.start()
+                    self.is_playing = True
+                    return
+                except Exception:
+                    pass
+            # Stream was closed — restart from current position
+            self.play()
 
     def seek(self, seconds: float):
+        was_playing = self.is_playing
+        if was_playing:
+            self.is_playing = False
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+
         with self._lock:
             if self._sr and self._data is not None:
                 self._pos = max(0, min(int(seconds * self._sr), len(self._data) - 1))
 
+        if was_playing:
+            self.play()
+
     # ── State ────────────────────────────────────────────────
 
     def get_position(self) -> float:
-        if self._sr and self._data is not None:
-            return self._pos / self._sr
+        with self._lock:
+            if self._sr and self._data is not None:
+                return self._pos / self._sr
         return 0.0
 
     def get_duration(self) -> float:
-        if self._sr and self._data is not None:
-            return len(self._data) / self._sr
+        with self._lock:
+            if self._sr and self._data is not None:
+                return len(self._data) / self._sr
         return 0.0
 
     def set_volume(self, vol: float):

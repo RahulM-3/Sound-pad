@@ -26,3 +26,5 @@ down_arrow.svg
 .idea/
 *.swp
 .DS_Store
+
+RELEASE_NOTES.md

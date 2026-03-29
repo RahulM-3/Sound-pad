@@ -173,6 +173,26 @@ class StyledComboBox(QComboBox):
             container.setFixedWidth(self.width())
 
 
+# ── Clickable Slider ─────────────────────────────────────────
+
+class ClickableSlider(QSlider):
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            # First process the normal mouse press to ensure handle logic holds, but we bypass the page step
+            val = self.minimum() + ((self.maximum() - self.minimum()) * ev.position().x()) / self.width()
+            self.setValue(int(val))
+            self.sliderPressed.emit()
+            ev.accept()
+        else:
+            super().mousePressEvent(ev)
+            
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.sliderReleased.emit()
+            ev.accept()
+        else:
+            super().mouseReleaseEvent(ev)
+
 # ── Sound Card ───────────────────────────────────────────────
 
 class SoundCard(QFrame):
@@ -404,7 +424,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.lbl_track)
 
         seek_row = QHBoxLayout()
-        self.seek = QSlider(Qt.Orientation.Horizontal)
+        self.seek = ClickableSlider(Qt.Orientation.Horizontal)
         self.seek.setRange(0, 1000)
         self.seek.sliderPressed.connect(lambda: setattr(self, "_seeking", True))
         self.seek.sliderReleased.connect(self._on_seek_released)
@@ -535,7 +555,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Profile", "Select or create a profile first.")
             return
 
-        exts = "Audio Files (*.wav *.mp3 *.ogg *.flac *.m4a *.aac *.wma *.aiff *.opus *.webm)"
+        exts = "Audio Files (*.wav *.mp3 *.ogg *.flac *.m4a *.aac *.wma *.aiff *.opus *.webm);;All Files (*.*)"
         paths, _ = QFileDialog.getOpenFileNames(self, "Select Audio Files", self._last_upload_dir, exts)
         if not paths:
             return
@@ -641,6 +661,10 @@ class MainWindow(QMainWindow):
         dur = self._player.get_duration()
         if dur > 0:
             self._player.seek(self.seek.value() / 1000 * dur)
+            # Auto-play on timeline click/seek as requested
+            if not self._player.is_playing:
+                self._player.resume()
+                self.btn_play.setIcon(get_icon("pause", "#ffffff", 24))
         self._seeking = False
 
     # ── Timer Tick ───────────────────────────────────────────
